@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <link rel="icon" href="favicon.ico">
+    <meta charset="UTF-8">
+    <title>Fleet Striker - Audio Restored</title>
+    <style>
+        body { background: #000; color: #fff; font-family: 'Helvetica', sans-serif; display: flex; justify-content: center; align-items: flex-start; gap: 20px; margin: 20px; overflow: hidden; }
+        #game-container { position: relative; border: 2px solid #0ff; background: #000; overflow: hidden; width: 500px; height: 650px; }
+        canvas { display: block; }
+        #ui-panel { width: 220px; background: rgba(5, 5, 10, 0.95); padding: 20px; border: 1px solid #0ff; }
+        .stat-label { color: #0ff; font-size: 0.7em; margin-top: 15px; letter-spacing: 2px; text-transform: uppercase; }
+        .stat-value { font-size: 2em; font-weight: bold; font-family: 'Courier New', monospace; }
+        #boss-hp-area { margin-top: 20px; display:none; }
+        .hp-bar-bg { width: 100%; height: 8px; background: #222; margin-top: 5px; border: 1px solid #f00; }
+        #boss-hp-bar { width: 100%; height: 100%; background: #f00; transition: width 0.2s; }
+        #start-guide { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; background: rgba(0,0,0,0.9); padding: 30px; border: 1px solid #0ff; z-index: 10; cursor: pointer; color: #0ff; }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <div id="start-guide" onclick="initGame()">
+        <h1 style="margin:0; font-size: 1.5em;">FLEET STRIKER</h1>
+        <p>BGM: Into the Light_2.mp3</p>
+        <p style="font-size:0.8em; border-top: 1px solid #0ff; padding-top: 10px;">CLICK TO DEPLOY & PLAY BGM</p>
+    </div>
+    <canvas id="gameCanvas" width="500" height="650"></canvas>
+</div>
+
+<div id="ui-panel">
+    <div class="stat-label">System Integrity</div>
+    <div id="life-display" class="stat-value">100</div>
+    <div class="stat-label">Boss Approach</div>
+    <div id="timer-display" class="stat-value">01:00</div>
+    <div class="stat-label">Sector</div>
+    <div id="stage-num" class="stat-value">1 / 6</div>
+    <div id="boss-hp-area">
+        <div class="stat-label" style="color:#ff0000;">ULTIMATE HOSTILE</div>
+        <div class="hp-bar-bg"><div id="boss-hp-bar"></div></div>
+    </div>
+</div>
+
+<script>
+// --- オーディオ設定 ---
+const BGM_URL = "Into the Light_2.mp3"; 
+let bgm = null;
+
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const startGuide = document.getElementById('start-guide');
+
+let gameActive = false;
+let lives = 100, stage = 1, frame = 0, invuln = 0, shake = 0;
+let isBossMode = false, startTime;
+const STAGE_DURATION = 60000;
+let player = { x: 250, y: 550, speed: 4 }; 
+let bullets = [], enemyBullets = [], enemies = [], boss = null, keys = {};
+
+const STAGE_THEMES = {
+    1: { gridColor: '#002222', enemyColor: '#f0f', enemyShape: 'diamond', bgSpeed: 3, logic: 'straight' },
+    2: { gridColor: '#220022', enemyColor: '#0ff', enemyShape: 'square', bgSpeed: 4, logic: 'wave' },
+    3: { gridColor: '#222200', enemyColor: '#ff0', enemyShape: 'triangle', bgSpeed: 5, logic: 'spiral' },
+    4: { gridColor: '#002200', enemyColor: '#0f0', enemyShape: 'cross', bgSpeed: 3, logic: 'step' },
+    5: { gridColor: '#220000', enemyColor: '#f00', enemyShape: 'star', bgSpeed: 6, logic: 'homing' },
+    6: { gridColor: '#111111', enemyColor: '#fff', enemyShape: 'chaos', bgSpeed: 8, logic: 'random' }
+};
+
+// 効果音用のAudioContext
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+function playSE(freq, type, dur, vol) {
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    const osc = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + dur);
+    g.gain.setValueAtTime(vol, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    osc.connect(g); g.connect(audioCtx.destination);
+    osc.start(); osc.stop(audioCtx.currentTime + dur);
+}
+
+// ゲーム開始 & BGM再生
+function initGame() {
+    if (gameActive) return;
+    
+    // BGMの生成と再生
+    bgm = new Audio(BGM_URL);
+    bgm.loop = true;
+    bgm.volume = 0.4;
+    
+    // ブラウザの制限を回避するため、プロミス形式で再生を確認
+    bgm.play().then(() => {
+        console.log("BGM started successfully.");
+    }).catch(error => {
+        console.warn("BGM play failed, waiting for next interaction.", error);
+    });
+
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+
+    gameActive = true;
+    startGuide.style.display = 'none';
+    startTime = Date.now();
+    update();
+}
+
+window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    // キー入力でもBGMが再生されていない場合は試行
+    if (gameActive && bgm && bgm.paused) bgm.play();
+});
+window.addEventListener('keyup', e => keys[e.code] = false);
+
+function update() {
+    if (!gameActive) return;
+    let now = Date.now();
+    let remaining = Math.max(0, STAGE_DURATION - (now - startTime));
+    document.getElementById('timer-display').textContent = `00:${Math.floor(remaining/1000).toString().padStart(2, '0')}`;
+
+    if (invuln > 0) invuln--;
+    if (shake > 0) shake--;
+
+    // ボス出現
+    if (remaining <= 0 && !isBossMode) {
+        isBossMode = true;
+        let bHp = 250 + (stage * 60);
+        boss = { x: 250, y: -100, targetY: 120, hp: bHp, maxHp: bHp, attackPattern: 0, patternTimer: 0 };
+        document.getElementById('boss-hp-area').style.display = 'block';
+    }
+
+    // 移動とショット
+    let spd = (keys['ShiftLeft'] || keys['ShiftRight']) ? 2 : player.speed;
+    if (keys['ArrowUp'] && player.y > 20) player.y -= spd;
+    if (keys['ArrowDown'] && player.y < 630) player.y += spd;
+    if (keys['ArrowLeft'] && player.x > 20) player.x -= spd;
+    if (keys['ArrowRight'] && player.x < 480) player.x += spd;
+
+    if (frame % 6 === 0) {
+        bullets.push({ x: player.x, y: player.y - 20, vx: 0 });
+        bullets.push({ x: player.x - 12, y: player.y - 10, vx: -0.5 });
+        bullets.push({ x: player.x + 12, y: player.y - 10, vx: 0.5 });
+    }
+
+    // 雑魚敵
+    const currentTheme = STAGE_THEMES[Math.min(stage, 6)];
+    if (!isBossMode && Math.random() < 0.05 + (stage * 0.01)) {
+        let ex = Math.random()*500;
+        enemies.push({ x: ex, y: -20, originX: ex, vy: 10 + (stage*0.15), logic: currentTheme.logic, hitFlash: 0 });
+    }
+
+    enemies.forEach((en, i) => {
+        if (en.hitFlash > 0) en.hitFlash--;
+        if (en.logic === 'wave') en.x += Math.sin(frame * 0.05) * 3;
+        if (en.logic === 'spiral') { en.x = en.originX + Math.cos(frame * 0.07) * 40; en.y += Math.sin(frame * 0.07) * 1.5; }
+        if (en.logic === 'step') { if (frame % 40 < 20) en.x += 3.5; else en.x -= 3.5; }
+        if (en.logic === 'homing') en.x += (player.x - en.x) * 0.015;
+        en.y += en.vy;
+        if (en.y > 670) enemies.splice(i, 1);
+        if (invuln === 0 && Math.hypot(en.x - player.x, en.y - player.y) < 15) { lives -= 1; invuln = 60; shake = 15; }
+    });
+
+    // ボス攻撃パターン (激化版)
+    if (boss) {
+        if (boss.y < boss.targetY) boss.y += 2;
+        boss.x = 250 + Math.sin(frame * 0.02) * 120;
+        
+        boss.patternTimer++;
+        if (boss.patternTimer > 150) { 
+            boss.attackPattern = Math.floor(Math.random() * 4); // パターン増
+            boss.patternTimer = 0;
+        }
+
+        let isRage = boss.hp < boss.maxHp / 2;
+        let shootInterval = isRage ? 10 : 20;
+
+        if (frame % shootInterval === 0) {
+            switch(boss.attackPattern) {
+                case 0: // 螺旋弾幕
+                    for(let i=0; i<8; i++){
+                        let ang = (i/8)*Math.PI*2 + (frame*0.1);
+                        enemyBullets.push({ x: boss.x, y: boss.y, vx: Math.cos(ang)*4, vy: Math.sin(ang)*4, color: '#f00' });
+                    }
+                    break;
+                case 1: // 高速狙い撃ち
+                    let ang = Math.atan2(player.y - boss.y, player.x - boss.x);
+                    enemyBullets.push({ x: boss.x, y: boss.y, vx: Math.cos(ang)*7, vy: Math.sin(ang)*7, color: '#ff0' });
+                    break;
+                case 2: // 弾の雨
+                    enemyBullets.push({ x: Math.random()*500, y: 0, vx: (Math.random()-0.5)*2, vy: 5, color: '#0ff' });
+                    break;
+                case 3: // 拡散ウェーブ
+                    for(let i=-2; i<=2; i++){
+                        enemyBullets.push({ x: boss.x, y: boss.y, vx: i*1.5, vy: 4, color: '#f0f' });
+                    }
+                    break;
+            }
+        }
+    }
+
+    // 衝突判定
+    bullets.forEach((b, bi) => {
+        b.y -= 15; b.x += b.vx;
+        enemies.forEach(en => {
+            if (Math.hypot(b.x - en.x, b.y - en.y) < 20) { en.y -= 2; en.hitFlash = 3; bullets.splice(bi, 1); }
+        });
+        if (boss && Math.hypot(b.x - boss.x, b.y - boss.y) < 50) {
+            boss.hp--; bullets.splice(bi, 1);
+            if (boss.hp <= 0) {
+                isBossMode = false; boss = null; stage++; startTime = Date.now();
+                document.getElementById('boss-hp-area').style.display = 'none';
+                document.getElementById('stage-num').textContent = `${stage} / 6`;
+            }
+        }
+    });
+
+    enemyBullets.forEach((eb, i) => {
+        eb.x += eb.vx; eb.y += eb.vy;
+        if (invuln === 0 && Math.hypot(eb.x - player.x, eb.y - player.y) < 7) { lives -= 3; invuln = 60; shake = 20; }
+        if (eb.y > 670 || eb.y < -50 || eb.x < -50 || eb.x > 550) enemyBullets.splice(i, 1);
+    });
+
+    if (lives <= 0) { 
+        if(bgm) bgm.pause();
+        alert("MISSION FAILED"); 
+        location.reload(); 
+    }
+    draw();
+    frame++;
+    requestAnimationFrame(update);
+}
+
+function draw() {
+    const theme = STAGE_THEMES[Math.min(stage, 6)];
+    ctx.save();
+    if (shake > 0) ctx.translate(Math.random()*shake - shake/2, Math.random()*shake - shake/2);
+    ctx.fillStyle = '#000'; ctx.fillRect(0, 0, 500, 650);
+    
+    ctx.strokeStyle = theme.gridColor;
+    for(let i=0; i<15; i++) {
+        let y = (frame * theme.bgSpeed + i * 50) % 750;
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(500, y); ctx.stroke();
+    }
+
+    if (invuln % 4 < 2) {
+        ctx.fillStyle = '#fff'; ctx.beginPath();
+        ctx.moveTo(player.x, player.y - 20); ctx.lineTo(player.x-12, player.y+10); ctx.lineTo(player.x+12, player.y+10);
+        ctx.closePath(); ctx.fill();
+    }
+
+    ctx.fillStyle = '#0ff'; bullets.forEach(b => ctx.fillRect(b.x-1, b.y, 2, 12));
+
+    enemies.forEach(en => {
+        ctx.strokeStyle = en.hitFlash > 0 ? '#fff' : theme.enemyColor;
+        ctx.strokeRect(en.x-10, en.y-10, 20, 20);
+    });
+
+    if (boss) {
+        ctx.save();
+        ctx.shadowBlur = 20; ctx.shadowColor = '#f00';
+        ctx.fillStyle = (boss.patternTimer < 15) ? '#fff' : '#300';
+        ctx.beginPath(); ctx.arc(boss.x, boss.y, 45, 0, Math.PI*2); ctx.fill();
+        ctx.strokeStyle = '#f00'; ctx.lineWidth = 4; ctx.stroke();
+        ctx.restore();
+        document.getElementById('boss-hp-bar').style.width = (boss.hp/boss.maxHp*100) + "%";
+    }
+
+    enemyBullets.forEach(eb => {
+        ctx.fillStyle = eb.color; ctx.beginPath(); ctx.arc(eb.x, eb.y, 5, 0, Math.PI*2); ctx.fill();
+    });
+
+    ctx.restore();
+    document.getElementById('life-display').textContent = Math.max(0, lives);
+}
+</script>
+</body>
+</html>
